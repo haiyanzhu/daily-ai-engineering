@@ -42,3 +42,7 @@ chroma_db/
 *.parquet
 *.pickle
 *.bin
+
+# Ignore all PDF files
+*.pdf
+**/*.pdf
