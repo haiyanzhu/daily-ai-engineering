@@ -1,0 +1,44 @@
+# Python Virtual Environments
+**/.venv/
+**/venv/
+**/env/
+**/ENV/
+
+# Environment Variables & Secrets
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+
+# Python Bytecode & Caches
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/*.so
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+**/build/
+**/dist/
+
+# AI / RAG Artifacts & Logs
+**/*.log
+**/*.sqlite3
+**/*.db
+
+# OS & Editor Files
+.DS_Store
+Thumbs.db
+**/.idea/
+**/.vscode/
+!**/.vscode/settings.json
+!**/.vscode/launch.json
+
+# ChromaDB persistence directory
+chroma_db/
+**/chroma_db/
+*.parquet
+*.pickle
+*.bin
