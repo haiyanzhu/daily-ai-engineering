@@ -47,3 +47,4 @@ chroma_db/
 # Ignore all PDF files
 *.pdf
 **/*.pdf
+**/chroma_episodes/
