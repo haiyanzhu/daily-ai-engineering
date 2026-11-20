@@ -7,10 +7,15 @@
 # the LLM only does the work inside each agent.
 # Test switch: FORCE_REVISE=1 forces REVISE on round 1 only, FORCE_REVISE=2
 # forces REVISE on every round (tests the revision limit). Reset to 0 for a real run.
+# Error guard (Day 30): writer/reviewer/revise calls go through
+# generate_with_guard — 429 waits ~60s and retries once, then falls back;
+# 503 falls back to gemini-3.5-flash immediately. If the reviewer loop
+# itself fails, main() ships the current draft with a note.
 # Acceptance: run with a NEW question, end to end, and report.md holds the writer's
 # report with a Sources list whose URLs all come from the researcher's findings.
 
 import json
+import random
 import sys
 import time
 from pathlib import Path
@@ -23,7 +28,9 @@ from google.genai import types
 load_dotenv()
 client = genai.Client()
 
-MODEL = "gemini-3.5-flash-lite"
+MODEL = "gemini-3.5-flash"
+FALLBACK_MODEL = "gemini-3.5-flash-lite"
+RETRY_WAIT_SECONDS = 60
 MAX_RESULTS = 5
 MIN_FINDINGS = 3
 MAX_CONSECUTIVE_ERRORS = 3
@@ -31,6 +38,52 @@ MAX_REVISION_ROUNDS = 2
 FORCE_REVISE = 0
 SLOPPY_WRITER = False
 DEFAULT_QUESTION = "What is the Model Context Protocol (MCP)?"
+
+
+# ---------------------------------------------------------------- error guard
+def _status_code(error: Exception) -> int | None:
+    """Best-effort HTTP status from a genai SDK error: the .code attribute
+    if present, else the status number inside the message string."""
+    code = getattr(error, "code", None)
+    if isinstance(code, int):
+        return code
+    message = str(error)
+    for status in (429, 503):
+        if str(status) in message:
+            return status
+    return None
+
+
+def _generate(model: str, prompt: str, config=None) -> str:
+    """Single generate_content call; returns the response text."""
+    response = client.models.generate_content(model=model, contents=prompt, config=config)
+    return response.text
+
+
+def generate_with_guard(prompt: str, config=None) -> str:
+    """One guarded generate_content call (P1 quota taxonomy).
+    429 (quota exhausted): wait ~60s + jitter, retry once on the same model,
+    then fall back to the other model.
+    503 (server overloaded): fall back to the other model immediately.
+    If every attempt fails, the last error raises to the caller, and main()
+    decides what to ship."""
+    try:
+        return _generate(MODEL, prompt, config)
+    except Exception as e:
+        status = _status_code(e)
+        if status == 429:
+            wait = RETRY_WAIT_SECONDS + random.uniform(0, 10)
+            print(f"[guard] 429 quota exhausted; waiting {wait:.0f}s, then retrying once")
+            time.sleep(wait)
+            try:
+                return _generate(MODEL, prompt, config)
+            except Exception as retry_error:
+                print(f"[guard] retry failed ({retry_error}); falling back to {FALLBACK_MODEL}")
+                return _generate(FALLBACK_MODEL, prompt, config)
+        if status == 503:
+            print(f"[guard] 503 server overloaded; falling back to {FALLBACK_MODEL}")
+            return _generate(FALLBACK_MODEL, prompt, config)
+        raise
 
 
 # ---------------------------------------------------------------- researcher
@@ -157,31 +210,9 @@ def write_report(question: str, findings: list[dict]) -> str:
             f"Question: {question}\n\n"
             f"Findings:\n{format_findings(findings)}"
         )
-    response = client.models.generate_content(model=MODEL, contents=prompt)
+    text = generate_with_guard(prompt)
     print("[writer] draft written")
-    return response.text
-
-
-# def write_report(question: str, findings: list[dict]) -> str:
-#     """Writer agent: pure generation, no tools. Writes a structured report
-#     from the findings only. Graded honesty (from P1): anything not in the
-#     findings is left out and the gap is marked explicitly."""
-#     prompt = (
-#         "You are a technical writer. Write a short structured report answering "
-#         "the question below, using ONLY the findings provided. Rules:\n"
-#         "- Start with a one-paragraph conclusion (answer first).\n"
-#         "- Then 2-4 short sections with headings.\n"
-#         "- Cite every factual claim as [Source N], where N is the finding number.\n"
-#         "- Never add facts, numbers, or links that are not in the findings.\n"
-#         "- If the findings do not cover part of the question, say so explicitly "
-#         "in a short 'Not covered by the findings' section.\n"
-#         "- End with a 'Sources' list: one line per finding, '[N] Title - URL'.\n\n"
-#         f"Question: {question}\n\n"
-#         f"Findings:\n{format_findings(findings)}"
-#     )
-#     response = client.models.generate_content(model=MODEL, contents=prompt)
-#     print("[writer] draft written")
-#     return response.text
+    return text
 
 
 # ---------------------------------------------------------------- reviewer
@@ -228,8 +259,7 @@ def review_report(question: str, findings: list[dict], draft: str, round_no: int
         f"Findings:\n{format_findings(findings)}\n\n"
         f"Draft report:\n{draft}"
     )
-    response = client.models.generate_content(model=MODEL, contents=prompt)
-    text = response.text.strip()
+    text = generate_with_guard(prompt).strip()
     first_line = text.splitlines()[0].strip().upper() if text else ""
     if first_line.startswith("VERDICT: PASS"):
         return "PASS", ""
@@ -254,9 +284,9 @@ def revise_report(question: str, findings: list[dict], draft: str, feedback: str
         f"Reviewer feedback:\n{feedback}\n\n"
         f"Current draft:\n{draft}"
     )
-    response = client.models.generate_content(model=MODEL, contents=prompt)
+    text = generate_with_guard(prompt)
     print("[writer] draft revised")
-    return response.text
+    return text
 
 
 # ---------------------------------------------------------------- orchestrator
@@ -285,29 +315,39 @@ def main() -> None:
     if not validate_findings(findings):
         print("[orchestrator] findings failed validation; stopping before the writer")
         return
-    report = write_report(question, findings)
+    try:
+        report = write_report(question, findings)
+    except Exception as e:
+        print(f"[orchestrator] writer failed ({e}); no report to ship")
+        return
 
     # Step 2: reviewer loop (evaluator-optimizer). At most MAX_REVISION_ROUNDS
     # rounds; if the last round still says REVISE, ship the current draft and
     # note the open items on top instead of looping forever.
+    # If the loop itself fails (API error after the guard's retry/fallback),
+    # ship the current draft with a note instead of crashing.
     open_items = ""
-    for round_no in range(1, MAX_REVISION_ROUNDS + 1):
-        verdict, feedback = review_report(question, findings, report, round_no)
-        print(f"[reviewer] round {round_no}: {verdict}")
-        if verdict == "PASS":
-            break
-        print(f"[reviewer] feedback:\n{feedback}")
-        if round_no == MAX_REVISION_ROUNDS:
-            open_items = feedback
-            print("[orchestrator] revision limit reached; shipping current draft")
-        else:
-            report = revise_report(question, findings, report, feedback)
-    print(f"[orchestrator] review finished after {round_no} round(s)")
+    try:
+        for round_no in range(1, MAX_REVISION_ROUNDS + 1):
+            verdict, feedback = review_report(question, findings, report, round_no)
+            print(f"[reviewer] round {round_no}: {verdict}")
+            if verdict == "PASS":
+                break
+            print(f"[reviewer] feedback:\n{feedback}")
+            if round_no == MAX_REVISION_ROUNDS:
+                open_items = feedback
+                print("[orchestrator] revision limit reached; shipping current draft")
+            else:
+                report = revise_report(question, findings, report, feedback)
+        print(f"[orchestrator] review finished after {round_no} round(s)")
+    except Exception as e:
+        print(f"[orchestrator] reviewer loop failed ({e}); shipping current draft")
+        open_items = f"Reviewer loop stopped by an API error: {e}"
 
     if open_items:
         note = (
-            "> **Reviewer open items:** this draft did not pass review within "
-            f"{MAX_REVISION_ROUNDS} revision rounds. Unresolved feedback:\n"
+            "> **Reviewer open items:** this draft did not finish review cleanly. "
+            "Unresolved feedback:\n"
             + "\n".join(f"> {line}" for line in open_items.splitlines() if line.strip())
             + "\n\n---\n\n"
         )
